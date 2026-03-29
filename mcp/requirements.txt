@@ -1,0 +1,2 @@
+# Keine externen Abhängigkeiten nötig.
+# Der Server nutzt nur Python-Standardbibliothek + rg (ripgrep).

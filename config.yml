@@ -1,0 +1,13 @@
+# mm-knowhow Konfiguration
+notes_dir: notes
+templates_dir: templates
+default_template: default
+editor: ${EDITOR:-nvim}
+
+# Noten-ID Format: YYYYMMDD-slug
+# Beispiel: 20260329-docker-networking
+
+# MCP Server (nur lokal)
+mcp:
+  host: 127.0.0.1
+  port: 9420

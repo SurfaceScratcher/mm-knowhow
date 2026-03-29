@@ -1,0 +1,13 @@
+# Notes werden in eigenem Repo verwaltet
+notes/
+
+# MCP-Konfig enthält lokale Pfade
+.mcp.json
+
+__pycache__/
+*.pyc
+.venv/
+mcp/.venv/
+*.swp
+*.swo
+*~

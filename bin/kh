@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================================
+# kh — mm-knowhow CLI
+# Persönliches Wissensmanagement im Zettelkasten-Stil
+# ============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+NOTES_DIR="$PROJECT_ROOT/notes"
+TEMPLATES_DIR="$PROJECT_ROOT/templates"
+EDITOR="${EDITOR:-nvim}"
+
+# ---- Helpers ---------------------------------------------------------------
+
+slugify() {
+  echo "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/ä/ae/g; s/ö/oe/g; s/ü/ue/g; s/ß/ss/g' \
+    | sed 's/[^a-z0-9]/-/g' \
+    | sed 's/--*/-/g; s/^-//; s/-$//' \
+    | cut -c1-60
+}
+
+generate_id() {
+  local title="$1"
+  local date_prefix
+  date_prefix="$(date +%Y%m%d)"
+  local slug
+  slug="$(slugify "$title")"
+  echo "${date_prefix}-${slug}"
+}
+
+now_iso() {
+  date +%Y-%m-%dT%H:%M:%S%z
+}
+
+apply_template() {
+  local template="${1:-default}"
+  local id="$2"
+  local title="$3"
+  local now
+  now="$(now_iso)"
+  local tpl_file="$TEMPLATES_DIR/${template}.md"
+
+  if [[ ! -f "$tpl_file" ]]; then
+    echo "Template nicht gefunden: $tpl_file" >&2
+    exit 1
+  fi
+
+  sed -e "s/{{ID}}/$id/g" \
+      -e "s/{{TITLE}}/$title/g" \
+      -e "s/{{CREATED}}/$now/g" \
+      -e "s/{{UPDATED}}/$now/g" \
+      "$tpl_file"
+}
+
+note_title() {
+  local file="$1"
+  sed -n 's/^title: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' "$file" | head -1
+}
+
+note_count() {
+  find "$NOTES_DIR" -name '*.md' 2>/dev/null | wc -l
+}
+
+# ---- Commands --------------------------------------------------------------
+
+cmd_add() {
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: kh add <titel>" >&2
+    exit 1
+  fi
+
+  local template="default"
+  if [[ "$1" == "-t" ]]; then
+    template="$2"
+    shift 2
+  fi
+
+  local title="$*"
+  local id
+  id="$(generate_id "$title")"
+  local filepath="$NOTES_DIR/${id}.md"
+
+  if [[ -f "$filepath" ]]; then
+    echo "Note existiert bereits: $id" >&2
+    echo "Verwende 'kh edit $id' zum Bearbeiten." >&2
+    exit 1
+  fi
+
+  apply_template "$template" "$id" "$title" > "$filepath"
+  $EDITOR "$filepath"
+
+  if [[ -f "$filepath" ]]; then
+    echo "✓ Erstellt: $id"
+  fi
+}
+
+cmd_quick() {
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: kh quick <titel> -m \"inhalt\"" >&2
+    echo "       echo \"inhalt\" | kh quick <titel>" >&2
+    exit 1
+  fi
+
+  local title=""
+  local content=""
+  local tags_str="[]"
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -m)
+        shift
+        content="$*"
+        break
+        ;;
+      -t)
+        shift
+        tags_str="[$1]"
+        shift
+        ;;
+      *)
+        if [[ -z "$title" ]]; then
+          title="$1"
+        else
+          title="$title $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$title" ]]; then
+    echo "Titel fehlt." >&2
+    exit 1
+  fi
+
+  # Read from stdin if no -m provided
+  if [[ -z "$content" ]] && [[ ! -t 0 ]]; then
+    content="$(cat)"
+  fi
+
+  if [[ -z "$content" ]]; then
+    echo "Inhalt fehlt. Nutze -m oder pipe." >&2
+    exit 1
+  fi
+
+  local id
+  id="$(generate_id "$title")"
+  local filepath="$NOTES_DIR/${id}.md"
+  local now
+  now="$(now_iso)"
+
+  cat > "$filepath" <<ENDNOTE
+---
+id: "${id}"
+title: "${title}"
+tags: ${tags_str}
+links: []
+created: "${now}"
+updated: "${now}"
+---
+
+# ${title}
+
+${content}
+ENDNOTE
+
+  echo "✓ Erstellt: $id"
+}
+
+cmd_search() {
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: kh search <query>" >&2
+    exit 1
+  fi
+
+  local query="$*"
+  local results
+  results="$(rg -l -i "$query" "$NOTES_DIR" 2>/dev/null || true)"
+
+  if [[ -z "$results" ]]; then
+    echo "Keine Treffer für: $query"
+    return
+  fi
+
+  if command -v fzf &>/dev/null; then
+    local selected
+    selected="$(echo "$results" | fzf \
+      --preview "rg -i --color=always -C 3 '$query' {}" \
+      --preview-window=right:60% \
+      --header="Suche: $query" \
+      --prompt="Note wählen> " || true)"
+
+    if [[ -n "$selected" ]]; then
+      $EDITOR "$selected"
+    fi
+  else
+    # Fallback ohne fzf
+    echo "Treffer für '$query':"
+    echo "$results" | while read -r f; do
+      local id
+      id="$(basename "$f" .md)"
+      local title
+      title="$(note_title "$f")"
+      printf "  %-40s %s\n" "$id" "$title"
+    done
+  fi
+}
+
+cmd_tags() {
+  if [[ "$(note_count)" -eq 0 ]]; then
+    echo "Keine Notizen vorhanden."
+    return
+  fi
+
+  rg -oN 'tags: \[([^\]]*)\]' "$NOTES_DIR" --replace '$1' 2>/dev/null \
+    | tr ',' '\n' \
+    | sed 's/^ *//; s/ *$//' \
+    | grep -v '^$' \
+    | sort \
+    | uniq -c \
+    | sort -rn
+}
+
+cmd_find_tag() {
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: kh find-tag <tag>" >&2
+    exit 1
+  fi
+
+  local tag="$1"
+  local found=0
+
+  rg -l "tags:.*${tag}" "$NOTES_DIR" 2>/dev/null | while read -r f; do
+    local id
+    id="$(basename "$f" .md)"
+    local title
+    title="$(note_title "$f")"
+    printf "%-40s %s\n" "$id" "$title"
+    found=1
+  done
+
+  if [[ "$found" -eq 0 ]]; then
+    echo "Keine Notizen mit Tag: $tag"
+  fi
+}
+
+cmd_links() {
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: kh links <note-id>" >&2
+    exit 1
+  fi
+
+  local note_id="$1"
+  local filepath="$NOTES_DIR/${note_id}.md"
+
+  # Fuzzy match if exact file not found
+  if [[ ! -f "$filepath" ]]; then
+    filepath="$(find "$NOTES_DIR" -name "*${note_id}*" -print -quit 2>/dev/null || true)"
+    if [[ -z "$filepath" ]] || [[ ! -f "$filepath" ]]; then
+      echo "Note nicht gefunden: $note_id" >&2
+      exit 1
+    fi
+    note_id="$(basename "$filepath" .md)"
+  fi
+
+  echo "=== Forward-Links (diese Note verlinkt auf) ==="
+  rg -oN '\[\[([^\]|]+)(\|[^\]]+)?\]\]' "$filepath" 2>/dev/null \
+    | sed 's/.*\[\[//; s/|.*//; s/\]\]//' \
+    | sort -u \
+    || echo "  (keine)"
+
+  echo ""
+  echo "=== Backlinks (Notizen die hierher verlinken) ==="
+  rg -l "\[\[${note_id}(\|[^\]]+)?\]\]" "$NOTES_DIR" 2>/dev/null \
+    | grep -v "$(basename "$filepath")" \
+    | while read -r f; do
+        local id
+        id="$(basename "$f" .md)"
+        local title
+        title="$(note_title "$f")"
+        printf "  %-40s %s\n" "$id" "$title"
+      done \
+    || echo "  (keine)"
+}
+
+cmd_list() {
+  local count="${1:-20}"
+
+  if [[ "$(note_count)" -eq 0 ]]; then
+    echo "Keine Notizen vorhanden. Erstelle eine mit: kh add <titel>"
+    return
+  fi
+
+  ls -t "$NOTES_DIR"/*.md 2>/dev/null | head -n "$count" | while read -r f; do
+    local id
+    id="$(basename "$f" .md)"
+    local title
+    title="$(note_title "$f")"
+    printf "%-40s %s\n" "$id" "$title"
+  done
+}
+
+cmd_edit() {
+  local query="${*:-}"
+
+  if [[ "$(note_count)" -eq 0 ]]; then
+    echo "Keine Notizen vorhanden."
+    return
+  fi
+
+  local selected
+
+  if [[ -z "$query" ]]; then
+    # Interactive selection with fzf
+    if command -v fzf &>/dev/null; then
+      selected="$(find "$NOTES_DIR" -name '*.md' | sort -r | fzf \
+        --preview 'head -30 {}' \
+        --preview-window=right:60% \
+        --header="Note zum Bearbeiten wählen" \
+        --prompt="Edit> " || true)"
+    else
+      echo "Bitte Note-ID angeben oder fzf installieren." >&2
+      exit 1
+    fi
+  else
+    # Find by query
+    local matches
+    matches="$(find "$NOTES_DIR" -name "*${query}*" 2>/dev/null || true)"
+
+    if [[ -z "$matches" ]]; then
+      # Try content search
+      matches="$(rg -l -i "$query" "$NOTES_DIR" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$matches" ]]; then
+      echo "Keine Note gefunden für: $query" >&2
+      exit 1
+    fi
+
+    local match_count
+    match_count="$(echo "$matches" | wc -l)"
+
+    if [[ "$match_count" -eq 1 ]]; then
+      selected="$matches"
+    elif command -v fzf &>/dev/null; then
+      selected="$(echo "$matches" | fzf \
+        --preview 'head -30 {}' \
+        --preview-window=right:60% \
+        --prompt="Edit> " || true)"
+    else
+      echo "Mehrere Treffer — bitte genauer angeben:"
+      echo "$matches" | while read -r f; do
+        echo "  $(basename "$f" .md)"
+      done
+      exit 1
+    fi
+  fi
+
+  if [[ -n "$selected" ]]; then
+    # Update timestamp
+    local now
+    now="$(now_iso)"
+    sed -i "s/^updated: .*/updated: \"${now}\"/" "$selected"
+    $EDITOR "$selected"
+  fi
+}
+
+cmd_stats() {
+  local total
+  total="$(note_count)"
+  echo "Notizen:  $total"
+
+  if [[ "$total" -gt 0 ]]; then
+    local tag_count
+    tag_count="$(cmd_tags 2>/dev/null | wc -l)"
+    echo "Tags:     $tag_count"
+
+    local newest
+    newest="$(ls -t "$NOTES_DIR"/*.md 2>/dev/null | head -1)"
+    if [[ -n "$newest" ]]; then
+      echo "Neueste:  $(basename "$newest" .md)"
+    fi
+
+    local oldest
+    oldest="$(ls -tr "$NOTES_DIR"/*.md 2>/dev/null | head -1)"
+    if [[ -n "$oldest" ]]; then
+      echo "Älteste:  $(basename "$oldest" .md)"
+    fi
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+kh — mm-knowhow Wissensmanagement
+
+Usage: kh <command> [args]
+
+Wissen erfassen:
+  add <titel>              Neue Note erstellen (öffnet Editor)
+  add -t <template> <titel>  Mit bestimmtem Template
+  quick <titel> -m "text"  Schnellnotiz ohne Editor
+
+Wissen finden:
+  search <query>           Volltextsuche (rg + fzf)
+  tags                     Alle Tags mit Anzahl
+  find-tag <tag>           Notizen nach Tag
+  links <note-id>          Forward-Links + Backlinks
+  list [n]                 Letzte n Notizen (Standard: 20)
+
+Bearbeiten:
+  edit [query]             Note finden und editieren
+
+Info:
+  stats                    Statistiken
+  help                     Diese Hilfe
+EOF
+}
+
+# ---- Dispatch --------------------------------------------------------------
+
+case "${1:-help}" in
+  add)       shift; cmd_add "$@" ;;
+  quick)     shift; cmd_quick "$@" ;;
+  search|s)  shift; cmd_search "$@" ;;
+  tags)      shift; cmd_tags "$@" ;;
+  find-tag)  shift; cmd_find_tag "$@" ;;
+  links)     shift; cmd_links "$@" ;;
+  list|ls)   shift; cmd_list "$@" ;;
+  edit|e)    shift; cmd_edit "$@" ;;
+  stats)     shift; cmd_stats "$@" ;;
+  help|-h|--help) usage ;;
+  *)
+    echo "Unbekanntes Kommando: $1" >&2
+    echo "Nutze 'kh help' für Hilfe." >&2
+    exit 1
+    ;;
+esac
