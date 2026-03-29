@@ -24,7 +24,7 @@ Developed and tested on Termux (Android), but works on any Linux/macOS system.
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USER/mm-knowhow.git
+git clone https://github.com/SurfaceScratcher/mm-knowhow.git
 cd mm-knowhow
 
 # Make the CLI executable and add it to PATH
